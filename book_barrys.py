@@ -489,21 +489,34 @@ def login(page):
         log.warning("Network idle timeout after login, continuing...")
     screenshot(page, "after_login")
 
-    # Verify login succeeded by checking for account content in the MT iframe
+    # Verify login succeeded by checking for account content
     logged_in = False
-    for frame in page.frames:
-        if "marianaiframes.com" in frame.url:
-            try:
-                body_text = frame.evaluate("() => document.body ? document.body.innerText.substring(0, 300) : ''")
-                if "Log Out" in body_text or "Reservations" in body_text or "Account" in body_text:
+
+    # Debug: log all frames and their content after login
+    for i, frame in enumerate(page.frames):
+        try:
+            url = frame.url
+            text = frame.evaluate("() => document.body ? document.body.innerText.substring(0, 300) : ''")
+            log.info(f"Post-login frame {i}: url={url[:80]} text={text[:150]}")
+            if "marianaiframes.com" in url or "marianatek.com" in url:
+                if "Log Out" in text or "Reservations" in text or "Account" in text:
                     logged_in = True
                     log.info("Login verified - found account content in MT iframe")
-                    break
-            except Exception:
-                pass
+        except Exception as e:
+            log.info(f"Post-login frame {i}: error reading - {e}")
+
+    # Also check the main page URL and text
+    log.info(f"Post-login main URL: {page.url}")
+    main_text = page.text_content("body") or ""
+    log.info(f"Post-login main page text: {main_text[:200]}")
+    if "Log Out" in main_text or "Reservations" in main_text:
+        logged_in = True
+        log.info("Login verified via main page content")
+
     if not logged_in:
         log.error("Login may have failed - no account content found")
-        return False
+        # Don't return False yet, try to continue anyway
+        log.info("Attempting to continue despite login check failure...")
 
     # Save auth state for future runs
     page.context.storage_state(path=str(STATE_FILE))
