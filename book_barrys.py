@@ -481,10 +481,10 @@ def login(page):
         except PlaywrightTimeout:
             continue
 
-    # Wait for navigation after login
-    time.sleep(8)
+    # Wait for navigation after login (longer on cloud servers)
+    time.sleep(15)
     try:
-        page.wait_for_load_state("networkidle", timeout=10000)
+        page.wait_for_load_state("networkidle", timeout=20000)
     except PlaywrightTimeout:
         log.warning("Network idle timeout after login, continuing...")
     screenshot(page, "after_login")
