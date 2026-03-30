@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # Setup
-load_dotenv()
+load_dotenv(override=False)  # Don't override system env vars (for Render)
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
