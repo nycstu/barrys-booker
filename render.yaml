@@ -1,0 +1,23 @@
+services:
+  - type: cron
+    name: barrys-booker
+    runtime: docker
+    schedule: "59 15 * * 4"  # 15:59 UTC = 11:59 ET (script waits until 12:00 ET)
+    region: oregon
+    envVars:
+      - key: BARRYS_EMAIL
+        sync: false
+      - key: BARRYS_PASSWORD
+        sync: false
+      - key: BARRYS_SPOTS
+        value: "DF-33,DF-32,DF-30,DF-29,DF-26,DF-27,DF-28"
+      - key: BARRYS_STUDIO
+        value: noho
+      - key: BARRYS_CLASS_TIME
+        value: "07:20"
+      - key: BARRYS_DAY
+        value: thursday
+      - key: TZ
+        value: America/New_York
+      - key: HEADLESS
+        value: "true"
