@@ -562,9 +562,11 @@ def navigate_to_schedule(page, target_date):
     day_name = target_date.strftime("%a").upper()  # THU
     log.info(f"Navigating to schedule for {date_str} ({day_name})")
 
-    # Navigate to schedule page
+    # Try URL with date param first (most reliable - skips date tab entirely)
+    schedule_url_with_date = f"{SCHEDULE_URL}?date={date_str}"
+    log.info(f"Navigating to: {schedule_url_with_date}")
     try:
-        page.goto(SCHEDULE_URL, wait_until="domcontentloaded", timeout=30000)
+        page.goto(schedule_url_with_date, wait_until="domcontentloaded", timeout=30000)
     except PlaywrightTimeout:
         log.warning("Schedule page load timed out, continuing...")
     time.sleep(5)
@@ -658,14 +660,27 @@ def navigate_to_schedule(page, target_date):
 
     screenshot(page, "schedule_with_date")
 
-    # Debug: dump what's visible on the schedule
+    # Debug: dump what's visible on the schedule, and verify correct date is showing
     mt = get_mt_frame(page)
     if mt:
         try:
             body_text = mt.evaluate("() => document.body ? document.body.innerText.substring(0, 1000) : ''")
-            log.info(f"MT schedule content: {body_text[:500]}")
-        except Exception:
-            pass
+            log.info(f"MT schedule content: {body_text[:600]}")
+
+            # Safety check: confirm the target date or day name appears in the schedule
+            day_short_upper = target_date.strftime("%a").upper()  # THU
+            day_full = target_date.strftime("%A")                 # Thursday
+            month_day = target_date.strftime("%b %-d")            # Apr 3
+            month_day2 = target_date.strftime("%b %d")            # Apr 03
+            if (day_short_upper in body_text or day_full in body_text or
+                    month_day in body_text or month_day2 in body_text or date_str in body_text):
+                log.info(f"DATE VERIFIED: schedule is showing {date_str} ({day_short_upper})")
+            else:
+                log.error(f"DATE NOT VERIFIED - schedule may not be showing {date_str}. "
+                          f"ABORTING to avoid booking wrong day. Body: {body_text[:200]}")
+                return False
+        except Exception as e:
+            log.warning(f"Could not verify schedule date: {e}")
 
     return True
 
