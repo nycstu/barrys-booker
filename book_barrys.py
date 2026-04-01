@@ -571,37 +571,84 @@ def navigate_to_schedule(page, target_date):
     screenshot(page, "schedule_page")
 
     # The schedule is inside the MT iframe. Find it and click the right date tab.
-    mt = get_mt_frame(page)
+    # Poll for MT iframe to appear on schedule page
+    mt = None
+    for attempt in range(15):
+        mt = get_mt_frame(page)
+        if mt:
+            break
+        time.sleep(1)
+        log.info(f"Waiting for MT iframe on schedule page (attempt {attempt+1}/15)...")
     if mt:
         log.info("Found MT iframe on schedule page, looking for date tabs...")
         time.sleep(3)
 
+        # Log everything in the MT iframe first for debugging
+        try:
+            mt_body = mt.evaluate("() => document.body ? document.body.innerText.substring(0, 800) : 'no body'")
+            log.info(f"MT iframe schedule body: {mt_body[:600]}")
+        except Exception as e:
+            log.warning(f"Could not read MT iframe body: {e}")
+
         # Click the Thursday date tab inside the MT iframe
-        # The tabs look like "Apr 2 THU" or just "THU" or the date number
-        day_short = target_date.strftime("%a")  # "Thu"
-        day_num = target_date.day
-        month_short = target_date.strftime("%b")  # "Apr"
+        # The tabs look like "Apr 2 THU", "THU", "Thursday", "4/3" etc.
+        day_short_upper = target_date.strftime("%a").upper()   # "THU"
+        day_short = target_date.strftime("%a")                 # "Thu"
+        day_full = target_date.strftime("%A")                  # "Thursday"
+        day_num = str(target_date.day)                         # "3"
+        month_short = target_date.strftime("%b")               # "Apr"
+        date_str_slash = target_date.strftime("%-m/%-d")       # "4/3"
 
         clicked_date = mt.evaluate(f"""() => {{
-            const els = document.querySelectorAll('*');
-            for (const el of els) {{
+            const dayShortUpper = '{day_short_upper}';
+            const dayShort = '{day_short}';
+            const dayFull = '{day_full}';
+            const dayNum = '{day_num}';
+            const monthShort = '{month_short}';
+            const dateSlash = '{date_str_slash}';
+
+            // Log all tab-like elements for debugging
+            const allEls = Array.from(document.querySelectorAll('*'));
+            const tabCandidates = allEls.filter(el => {{
                 const text = el.textContent.trim();
-                // Match "THU" tab or "Apr 2" or date number
-                if ((text.includes('THU') || text.includes('Thu')) && text.length < 20) {{
-                    el.click();
-                    return 'clicked: ' + text;
+                return text.length > 0 && text.length < 30 &&
+                    (el.tagName === 'BUTTON' || el.tagName === 'A' ||
+                     el.getAttribute('role') === 'tab' ||
+                     el.getAttribute('role') === 'button' ||
+                     el.classList.toString().toLowerCase().includes('tab') ||
+                     el.classList.toString().toLowerCase().includes('day') ||
+                     el.classList.toString().toLowerCase().includes('date'));
+            }});
+            console.log('Tab candidates:', tabCandidates.map(e => e.textContent.trim()).join(' | '));
+
+            // Try to click a tab matching Thursday's date
+            const matchers = [dayShortUpper, dayShort, dayFull, dateSlash,
+                              monthShort + ' ' + dayNum, dayNum + ' ' + dayShortUpper];
+            for (const matcher of matchers) {{
+                for (const el of allEls) {{
+                    const text = el.textContent.trim();
+                    if (text.includes(matcher) && text.length < 30) {{
+                        el.click();
+                        return 'clicked (' + matcher + '): ' + text;
+                    }}
                 }}
             }}
-            return 'not found';
+
+            // Fallback: dump all short text elements
+            const shortTexts = allEls
+                .map(el => el.textContent.trim())
+                .filter(t => t.length > 0 && t.length < 25)
+                .filter((v, i, a) => a.indexOf(v) === i)
+                .slice(0, 30);
+            return 'not found. short texts: ' + JSON.stringify(shortTexts);
         }}""")
         log.info(f"Date tab click: {clicked_date}")
         time.sleep(3)
     else:
         # No MT iframe on schedule page, try clicking date tabs on main page
         log.info("No MT iframe found, trying main page date navigation...")
-        # Click the THU tab on the main page
         try:
-            thu_tab = page.wait_for_selector(f'text=THU', timeout=5000)
+            thu_tab = page.wait_for_selector('text=THU', timeout=5000)
             if thu_tab:
                 thu_tab.click()
                 log.info("Clicked THU tab on main page")
@@ -905,6 +952,8 @@ def run_booking():
         context_opts = {
             "viewport": {"width": 1280, "height": 800},
             "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
         }
         if STATE_FILE.exists():
             context_opts["storage_state"] = str(STATE_FILE)
