@@ -233,23 +233,31 @@ def login(page):
                 continue
 
     # Step 3: The login form is inside a Mariana Tek iframe
-    # Find the Mariana Tek iframe frame
+    # Poll for MT iframe - cloud servers take longer to load
     mt_frame = None
-    for frame in page.frames:
-        if "marianaiframes.com" in frame.url:
-            mt_frame = frame
-            log.info(f"Found Mariana Tek iframe: {frame.url[:80]}")
+    for attempt in range(20):
+        for frame in page.frames:
+            if "marianaiframes.com" in frame.url or "marianatek.com" in frame.url:
+                mt_frame = frame
+                log.info(f"Found Mariana Tek iframe (attempt {attempt+1}): {frame.url[:80]}")
+                break
+        if mt_frame:
             break
+        time.sleep(1)
+        log.info(f"Waiting for MT iframe on login page (attempt {attempt+1}/20)...")
+        if attempt % 5 == 4:
+            for i, f in enumerate(page.frames):
+                log.info(f"  Frame {i}: {f.url[:80]}")
 
     if not mt_frame:
-        log.error("Could not find Mariana Tek iframe")
+        log.error("Could not find Mariana Tek iframe after 20s")
         screenshot(page, "no_mt_iframe")
         return False
 
     # Wait for the iframe SPA to fully render
     login_frame = mt_frame
     log.info("Waiting for Mariana Tek iframe to render...")
-    time.sleep(5)
+    time.sleep(3)
     screenshot(page, "mt_iframe_found")
 
     # The MT iframe shows "Welcome Back / Please log in / LOG IN" but no input fields yet.
@@ -302,15 +310,28 @@ def login(page):
     except Exception as e:
         log.warning(f"Could not click LOG IN: {e}")
 
-    # Re-acquire the MT iframe frame reference (it navigated to the login page)
+    # Re-acquire the MT iframe frame reference (it navigated to marianatek.com/auth/login)
+    # Poll for up to 20 seconds - cloud servers are slower
     login_frame = None
-    for frame in page.frames:
-        if "marianaiframes.com" in frame.url:
-            login_frame = frame
-            log.info(f"Re-acquired MT iframe after navigation: {frame.url[:80]}")
+    for attempt in range(20):
+        for frame in page.frames:
+            if "marianaiframes.com" in frame.url or "marianatek.com" in frame.url:
+                login_frame = frame
+                log.info(f"Re-acquired MT iframe after navigation (attempt {attempt+1}): {frame.url[:80]}")
+                break
+        if login_frame:
             break
+        time.sleep(1)
+        log.info(f"Waiting for MT iframe to appear after LOG IN click (attempt {attempt+1}/20)...")
+        # Log all current frames for debugging
+        if attempt % 5 == 4:
+            for i, f in enumerate(page.frames):
+                log.info(f"  Current frame {i}: {f.url[:80]}")
     if not login_frame:
-        log.error("Lost MT iframe after LOG IN click")
+        log.error("Lost MT iframe after LOG IN click - dumping all frames:")
+        for i, f in enumerate(page.frames):
+            log.error(f"  Frame {i}: {f.url[:80]}")
+        screenshot(page, "lost_mt_iframe")
         return False
 
     # Now the login form (email + password) should be visible inside the iframe
@@ -527,8 +548,11 @@ def login(page):
 def get_mt_frame(page):
     """Find and return the current Mariana Tek iframe."""
     for frame in page.frames:
-        if "marianaiframes.com" in frame.url or "marianatek.com" in frame.url:
+        url = frame.url
+        if "marianaiframes.com" in url or "marianatek.com" in url:
             return frame
+    # Log all frames if not found
+    log.debug(f"get_mt_frame: no MT frame found in {[f.url[:60] for f in page.frames]}")
     return None
 
 
