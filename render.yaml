@@ -2,7 +2,7 @@ services:
   - type: cron
     name: barrys-booker
     runtime: docker
-    schedule: "59 15 * * 4"  # 15:59 UTC = 11:59 ET (script waits until 12:00 ET)
+    schedule: "50 15 * * 4"  # 15:50 UTC = 11:50 ET (logs in early, waits until 12:00 ET to book)
     region: oregon
     envVars:
       - key: BARRYS_EMAIL

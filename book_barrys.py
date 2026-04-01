@@ -977,39 +977,60 @@ def run_booking():
         page = context.new_page()
 
         try:
-            # Step 1: Login
+            # Step 1: Login FIRST (before waiting for 12:00) so we're ready to go
             if not login(page):
                 log.error("LOGIN FAILED - check credentials and screenshots")
                 return False
 
-            # Step 2: Navigate to schedule
+            # Step 2: Navigate to schedule BEFORE 12:00 so page is warm
             if not navigate_to_schedule(page, target_date):
                 log.error("SCHEDULE NAVIGATION FAILED")
                 return False
 
-            # Step 3: Find and click the class
-            if not find_and_click_class(page):
-                log.error("CLASS NOT FOUND - check if booking window is open")
+            # Step 3: Wait until exactly 12:00:00 ET (booking window opens)
+            # We're already logged in and on the schedule page - now we wait for the gun
+            if "--wait" in sys.argv:
+                wait_for_booking_window()
+
+            # Step 4: Find and click the class - retry with page refresh for up to 60s
+            # in case the booking button takes a moment to appear after 12:00
+            booked = False
+            for attempt in range(6):  # try up to 6 times (every ~10s for 60s)
+                if attempt > 0:
+                    log.info(f"Retry {attempt}/5 - refreshing schedule page...")
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=20000)
+                    except PlaywrightTimeout:
+                        pass
+                    time.sleep(3)
+
+                if not find_and_click_class(page):
+                    log.warning(f"Class not found on attempt {attempt+1}, retrying...")
+                    continue
+
+                # Step 5: Click RESERVE
+                if not confirm_booking(page):
+                    log.warning(f"RESERVE not available on attempt {attempt+1}, retrying...")
+                    continue
+
+                # Step 6: Select spot from the map
+                time.sleep(3)
+                spot_ok = select_spot(page)
+                if not spot_ok:
+                    log.warning("No preferred spot available, continuing without spot selection...")
+
+                # Step 7: Final confirmation
+                screenshot(page, "pre_final_confirm")
+                confirm_booking(page)
+
+                log.info("BOOKING COMPLETE!")
+                screenshot(page, "final_success")
+                booked = True
+                break
+
+            if not booked:
+                log.error("Could not complete booking after all retries")
                 return False
-
-            # Step 4: Click RESERVE to get to spot selection
-            # (Barry's flow: click class -> RESERVE -> spot map -> confirm)
-            if not confirm_booking(page):
-                log.error("RESERVE BUTTON NOT FOUND")
-                return False
-
-            # Step 5: Select spot from the map
-            time.sleep(3)
-            spot_ok = select_spot(page)
-            if not spot_ok:
-                log.warning(f"No preferred spot available, continuing without spot selection...")
-
-            # Step 6: Final confirmation (if there's another confirm button after spot)
-            screenshot(page, "pre_final_confirm")
-            confirm_booking(page)  # May or may not have another confirm
-
-            log.info("BOOKING COMPLETE!")
-            screenshot(page, "final_success")
             return True
 
         except Exception as e:
@@ -1021,8 +1042,9 @@ def run_booking():
             browser.close()
 
 
-def wait_for_booking_window():
-    """If running early, wait until exactly 12:00:00 ET to start."""
+def wait_for_booking_window(max_wait_minutes=15):
+    """Wait until exactly 12:00:00 ET. Call this after login/navigation so
+    the browser is already warmed up and we hit RESERVE right at open."""
     try:
         from zoneinfo import ZoneInfo
     except ImportError:
@@ -1031,25 +1053,27 @@ def wait_for_booking_window():
     now = datetime.now(et)
     target = now.replace(hour=12, minute=0, second=0, microsecond=0)
 
-    if now < target:
-        wait_seconds = (target - now).total_seconds()
-        if wait_seconds < 300:  # only wait if less than 5 min early
-            log.info(f"Waiting {wait_seconds:.0f}s until 12:00:00 ET...")
-            time.sleep(max(0, wait_seconds - 2))
-            # Busy-wait the last 2 seconds for precision
-            while datetime.now(et) < target:
-                time.sleep(0.05)
-            log.info("Booking window open - GO!")
+    if now >= target:
+        log.info(f"Already past 12:00 ET ({now.strftime('%H:%M:%S')} ET) - booking should be open")
+        return
+
+    wait_seconds = (target - now).total_seconds()
+    if wait_seconds > max_wait_minutes * 60:
+        log.info(f"Too early ({wait_seconds:.0f}s until 12:00 ET) - starting immediately anyway")
+        return
+
+    log.info(f"Waiting {wait_seconds:.0f}s until exactly 12:00:00 ET...")
+    time.sleep(max(0, wait_seconds - 2))
+    # Busy-wait the last 2 seconds for precision
+    while datetime.now(et) < target:
+        time.sleep(0.05)
+    log.info("12:00:00 ET - Booking window open - GO!")
 
 
 if __name__ == "__main__":
     log.info("=" * 60)
     log.info("Barry's Bootcamp Auto-Booker Starting")
     log.info("=" * 60)
-
-    # If --wait flag passed, wait for the 12p window
-    if "--wait" in sys.argv:
-        wait_for_booking_window()
 
     success = run_booking()
     sys.exit(0 if success else 1)
