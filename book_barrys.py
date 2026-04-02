@@ -1083,7 +1083,10 @@ def run_booking():
                 time.sleep(3)
                 spot_ok = select_spot(page)
                 if not spot_ok:
-                    log.warning("No preferred spot available, continuing without spot selection...")
+                    log.error("None of the preferred spots are available - ABORTING booking. "
+                              f"Preferred: {PREFERRED_SPOTS}")
+                    screenshot(page, "no_preferred_spot_abort")
+                    return False
 
                 # Step 7: Final confirmation (COMPLETE RESERVATION button)
                 screenshot(page, "pre_final_confirm")
