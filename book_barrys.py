@@ -585,47 +585,83 @@ def navigate_to_schedule(page, target_date):
         log.info("Found MT iframe on schedule page, looking for date tabs...")
         time.sleep(3)
 
-        # Log everything in the MT iframe first for debugging
+        # Log the MT iframe body for debugging
         try:
             mt_body = mt.evaluate("() => document.body ? document.body.innerText.substring(0, 800) : 'no body'")
             log.info(f"MT iframe schedule body: {mt_body[:600]}")
         except Exception as e:
             log.warning(f"Could not read MT iframe body: {e}")
 
-        # Click the Thursday date tab inside the MT iframe
-        # The tabs look like "Apr 2 THU", "THU", "Thursday", "4/3" etc.
+        # The schedule shows a weekly view. We may need to click "next week" to reach target date.
+        # Keep clicking the forward/next button until target date appears in the tabs (max 4 weeks).
+        month_day_target = target_date.strftime("%b %-d")   # e.g. "Apr 9"
+        month_day_target2 = target_date.strftime("%b %d")   # e.g. "Apr 09"
+
+        for week_advance in range(4):
+            try:
+                body_text = mt.evaluate("() => document.body ? document.body.innerText : ''")
+            except Exception:
+                body_text = ""
+
+            if month_day_target in body_text or month_day_target2 in body_text or date_str in body_text:
+                log.info(f"Target date {month_day_target} is visible after {week_advance} week advances")
+                break
+
+            if week_advance == 0:
+                log.info(f"Target date {month_day_target} not in current week view, clicking next week...")
+            else:
+                log.info(f"Still not visible, clicking next week again (advance {week_advance+1})...")
+
+            # Click the next-week navigation button (typically a ">" or chevron arrow)
+            nav_clicked = mt.evaluate("""() => {
+                const allEls = Array.from(document.querySelectorAll('*'));
+                // Look for next/forward navigation buttons
+                const nextBtns = allEls.filter(el => {
+                    const text = el.textContent.trim();
+                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    const cls = el.className.toString().toLowerCase();
+                    return (text === '>' || text === '›' || text === '»' || text === '→' ||
+                            aria.includes('next') || aria.includes('forward') ||
+                            cls.includes('next') || cls.includes('forward') || cls.includes('right')) &&
+                           (el.tagName === 'BUTTON' || el.tagName === 'A' || el.getAttribute('role') === 'button');
+                });
+                if (nextBtns.length > 0) {
+                    nextBtns[0].click();
+                    return 'clicked next: ' + nextBtns[0].textContent.trim() +
+                           ' aria=' + (nextBtns[0].getAttribute('aria-label') || '');
+                }
+                // Fallback: find any clickable element with just ">" or arrow chars
+                for (const el of allEls) {
+                    const text = el.textContent.trim();
+                    if ((text === '>' || text === '›' || text === '»') && el.children.length === 0) {
+                        el.click();
+                        return 'clicked arrow: ' + text;
+                    }
+                }
+                return 'next button not found';
+            }""")
+            log.info(f"Next week nav result: {nav_clicked}")
+            time.sleep(3)
+
+        # Now click the specific day tab for the target date
         day_short_upper = target_date.strftime("%a").upper()   # "THU"
-        day_short = target_date.strftime("%a")                 # "Thu"
-        day_full = target_date.strftime("%A")                  # "Thursday"
-        day_num = str(target_date.day)                         # "3"
         month_short = target_date.strftime("%b")               # "Apr"
-        date_str_slash = target_date.strftime("%-m/%-d")       # "4/3"
+        day_num = str(target_date.day)                         # "9"
 
         clicked_date = mt.evaluate(f"""() => {{
-            const dayShortUpper = '{day_short_upper}';
-            const dayShort = '{day_short}';
-            const dayFull = '{day_full}';
-            const dayNum = '{day_num}';
+            const target = '{month_day_target}';
+            const dayShort = '{day_short_upper}';
             const monthShort = '{month_short}';
-            const dateSlash = '{date_str_slash}';
-
-            // Log all tab-like elements for debugging
+            const dayNum = '{day_num}';
             const allEls = Array.from(document.querySelectorAll('*'));
-            const tabCandidates = allEls.filter(el => {{
-                const text = el.textContent.trim();
-                return text.length > 0 && text.length < 30 &&
-                    (el.tagName === 'BUTTON' || el.tagName === 'A' ||
-                     el.getAttribute('role') === 'tab' ||
-                     el.getAttribute('role') === 'button' ||
-                     el.classList.toString().toLowerCase().includes('tab') ||
-                     el.classList.toString().toLowerCase().includes('day') ||
-                     el.classList.toString().toLowerCase().includes('date'));
-            }});
-            console.log('Tab candidates:', tabCandidates.map(e => e.textContent.trim()).join(' | '));
 
-            // Try to click a tab matching Thursday's date
-            const matchers = [dayShortUpper, dayShort, dayFull, dateSlash,
-                              monthShort + ' ' + dayNum, dayNum + ' ' + dayShortUpper];
+            // Log all short texts for debugging
+            const shortTexts = allEls.map(e => e.textContent.trim())
+                .filter(t => t.length > 0 && t.length < 30)
+                .filter((v,i,a) => a.indexOf(v) === i).slice(0, 40);
+            console.log('Visible texts:', JSON.stringify(shortTexts));
+
+            const matchers = [target, monthShort + ' ' + dayNum, dayNum + ' ' + dayShort];
             for (const matcher of matchers) {{
                 for (const el of allEls) {{
                     const text = el.textContent.trim();
@@ -635,14 +671,7 @@ def navigate_to_schedule(page, target_date):
                     }}
                 }}
             }}
-
-            // Fallback: dump all short text elements
-            const shortTexts = allEls
-                .map(el => el.textContent.trim())
-                .filter(t => t.length > 0 && t.length < 25)
-                .filter((v, i, a) => a.indexOf(v) === i)
-                .slice(0, 30);
-            return 'not found. short texts: ' + JSON.stringify(shortTexts);
+            return 'tab not found. visible: ' + JSON.stringify(shortTexts.slice(0,20));
         }}""")
         log.info(f"Date tab click: {clicked_date}")
         time.sleep(3)
