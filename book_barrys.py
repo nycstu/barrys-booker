@@ -667,17 +667,20 @@ def navigate_to_schedule(page, target_date):
             body_text = mt.evaluate("() => document.body ? document.body.innerText.substring(0, 1000) : ''")
             log.info(f"MT schedule content: {body_text[:600]}")
 
-            # Safety check: confirm the target date or day name appears in the schedule
-            day_short_upper = target_date.strftime("%a").upper()  # THU
-            day_full = target_date.strftime("%A")                 # Thursday
-            month_day = target_date.strftime("%b %-d")            # Apr 3
-            month_day2 = target_date.strftime("%b %d")            # Apr 03
-            if (day_short_upper in body_text or day_full in body_text or
-                    month_day in body_text or month_day2 in body_text or date_str in body_text):
-                log.info(f"DATE VERIFIED: schedule is showing {date_str} ({day_short_upper})")
+            # Safety check: confirm the SPECIFIC target date appears in the schedule
+            # Must match the actual date (e.g. "Apr 9" or "April 9") - NOT just "THU"
+            # because today could also be Thursday
+            month_day = target_date.strftime("%b %-d")   # "Apr 9"
+            month_day2 = target_date.strftime("%b %d")   # "Apr 09"
+            day_num = str(target_date.day)               # "9"
+            date_checks = [month_day, month_day2, date_str]  # "Apr 9", "Apr 09", "2026-04-09"
+            date_found = any(d in body_text for d in date_checks)
+            log.info(f"Date check - looking for {date_checks} in schedule body")
+            if date_found:
+                log.info(f"DATE VERIFIED: schedule is showing {date_str}")
             else:
-                log.error(f"DATE NOT VERIFIED - schedule may not be showing {date_str}. "
-                          f"ABORTING to avoid booking wrong day. Body: {body_text[:200]}")
+                log.error(f"DATE NOT VERIFIED - schedule is NOT showing {date_str}. "
+                          f"ABORTING to avoid booking wrong day. Body: {body_text[:300]}")
                 return False
         except Exception as e:
             log.warning(f"Could not verify schedule date: {e}")
@@ -703,6 +706,25 @@ def find_and_click_class(page):
         log.info(f"Searching for class in {target_name}...")
 
         # Use JS to find and click the 7:20 class entry
+        # Log all time-like elements first so we can see what's on the schedule
+        try:
+            all_times = target.evaluate("""() => {
+                const timeRe = /\\d{1,2}:\\d{2}/;
+                const seen = new Set();
+                const times = [];
+                document.querySelectorAll('*').forEach(el => {
+                    const text = el.textContent.trim();
+                    if (timeRe.test(text) && text.length < 50 && !seen.has(text)) {
+                        seen.add(text);
+                        times.push(text);
+                    }
+                });
+                return times.slice(0, 20);
+            }""")
+            log.info(f"Times visible on schedule ({target_name}): {all_times}")
+        except Exception:
+            pass
+
         try:
             result = target.evaluate("""(timeVariants) => {
                 const allElements = document.querySelectorAll('*');
@@ -710,7 +732,9 @@ def find_and_click_class(page):
                 for (const el of allElements) {
                     const text = el.textContent.trim();
                     for (const t of timeVariants) {
-                        if (text.includes(t) && text.length < 200) {
+                        // Must START with the time to avoid matching "10:20" etc.
+                        if ((text === t || text.startsWith(t) || text.startsWith(t + ' ') || text.startsWith(t + 'a') || text.startsWith(t + 'p'))
+                            && text.length < 200) {
                             matches.push({tag: el.tagName, text: text.substring(0, 100), children: el.children.length});
                         }
                     }
@@ -720,7 +744,8 @@ def find_and_click_class(page):
                 for (const el of allElements) {
                     const text = el.textContent.trim();
                     for (const t of timeVariants) {
-                        if (text.includes(t) && text.length < 200 && el.children.length < 5) {
+                        if ((text === t || text.startsWith(t) || text.startsWith(t + ' ') || text.startsWith(t + 'a') || text.startsWith(t + 'p'))
+                            && text.length < 200 && el.children.length < 5) {
                             el.click();
                             return 'clicked: ' + text.substring(0, 80);
                         }
