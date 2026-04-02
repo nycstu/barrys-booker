@@ -724,8 +724,14 @@ def find_and_click_class(page):
 
     time_variants = ["7:20", "07:20", "7:20 AM", "7:20am", "7:20 am", "07:20 AM"]
 
-    # The classes are inside the MT iframe
-    mt = get_mt_frame(page)
+    # Poll for MT iframe - it must be present to find the class
+    mt = None
+    for attempt in range(10):
+        mt = get_mt_frame(page)
+        if mt:
+            break
+        time.sleep(1)
+        log.info(f"Waiting for MT iframe in find_and_click_class (attempt {attempt+1}/10)...")
     search_targets = [mt, page] if mt else [page]
 
     for target in search_targets:
@@ -1058,17 +1064,17 @@ def run_booking():
             if "--wait" in sys.argv:
                 wait_for_booking_window()
 
-            # Step 4: Find and click the class - retry with page refresh for up to 60s
+            # Step 4: Find and click the class - retry with full re-navigation for up to 60s
             # in case the booking button takes a moment to appear after 12:00
             booked = False
             for attempt in range(6):  # try up to 6 times (every ~10s for 60s)
                 if attempt > 0:
-                    log.info(f"Retry {attempt}/5 - refreshing schedule page...")
-                    try:
-                        page.reload(wait_until="domcontentloaded", timeout=20000)
-                    except PlaywrightTimeout:
-                        pass
-                    time.sleep(3)
+                    log.info(f"Retry {attempt}/5 - re-navigating to schedule...")
+                    time.sleep(5)
+                    # Re-navigate fully so we get back to the right week and date tab
+                    if not navigate_to_schedule(page, target_date):
+                        log.warning(f"Schedule re-navigation failed on retry {attempt}")
+                        continue
 
                 if not find_and_click_class(page):
                     log.warning(f"Class not found on attempt {attempt+1}, retrying...")
