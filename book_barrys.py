@@ -947,33 +947,47 @@ def select_spot(page):
 
 
 def confirm_booking(page):
-    """Click the final confirm/book button."""
+    """Click the final confirm/book button. Retries for up to 15s."""
     log.info("Looking for confirmation button...")
-    time.sleep(2)
 
-    # Try MT iframe first
-    mt = get_mt_frame(page)
-    if mt:
-        try:
-            result = mt.evaluate("""() => {
-                const els = document.querySelectorAll('button, a, [role="button"]');
-                for (const el of els) {
-                    const text = el.textContent.trim().toUpperCase();
-                    if (text.includes('CONFIRM') || text.includes('BOOK') || text.includes('RESERVE') || text.includes('COMPLETE')) {
-                        el.click();
-                        return 'clicked: ' + text;
+    # Retry loop - button may take a moment to appear after spot selection
+    for attempt in range(5):
+        time.sleep(3)
+
+        # Try MT iframe first
+        mt = get_mt_frame(page)
+        if mt:
+            try:
+                result = mt.evaluate("""() => {
+                    const els = document.querySelectorAll('button, a, [role="button"]');
+                    const allText = Array.from(els).map(e => e.textContent.trim()).join(' | ');
+                    for (const el of els) {
+                        const text = el.textContent.trim().toUpperCase();
+                        if (text.includes('CONFIRM') || text.includes('COMPLETE') ||
+                            text.includes('BOOK') || text.includes('RESERVE')) {
+                            el.click();
+                            return 'clicked: ' + text;
+                        }
                     }
-                }
-                return 'not found';
-            }""")
-            log.info(f"MT iframe confirm: {result}")
-            if "clicked" in result:
-                time.sleep(5)
-                screenshot(page, "booking_confirmed_mt")
-                return True
-        except Exception as e:
-            log.warning(f"MT iframe confirm error: {e}")
+                    return 'not found. buttons: ' + allText.substring(0, 300);
+                }""")
+                log.info(f"MT iframe confirm (attempt {attempt+1}): {result}")
+                if "clicked" in result:
+                    time.sleep(5)
+                    screenshot(page, "booking_confirmed_mt")
+                    return True
+            except Exception as e:
+                log.warning(f"MT iframe confirm error: {e}")
 
+        log.info(f"Confirm button not found on attempt {attempt+1}, waiting...")
+
+    screenshot(page, "no_confirm_button")
+    log.error("Could not find confirmation button after all retries")
+    return False
+
+
+def confirm_booking_selectors(page):
+    """Fallback selector-based confirm."""
     confirm_selectors = [
         'button:has-text("Confirm")',
         'button:has-text("Book")',
@@ -997,8 +1011,6 @@ def confirm_booking(page):
         except PlaywrightTimeout:
             continue
 
-    screenshot(page, "no_confirm_button")
-    log.error("Could not find confirmation button")
     return False
 
 
@@ -1073,9 +1085,11 @@ def run_booking():
                 if not spot_ok:
                     log.warning("No preferred spot available, continuing without spot selection...")
 
-                # Step 7: Final confirmation
+                # Step 7: Final confirmation (COMPLETE RESERVATION button)
                 screenshot(page, "pre_final_confirm")
-                confirm_booking(page)
+                if not confirm_booking(page):
+                    log.warning(f"COMPLETE RESERVATION not found on attempt {attempt+1}, retrying...")
+                    continue
 
                 log.info("BOOKING COMPLETE!")
                 screenshot(page, "final_success")
