@@ -953,30 +953,42 @@ def select_spot(page):
 
 
 def confirm_booking(page):
-    """Click the final confirm/book button. Retries for up to 15s."""
+    """Click the final confirm/book button. Retries for up to 15s.
+
+    Searches both the MT iframe AND the main page DOM — after spot selection
+    Barry's may render the final confirm button outside the iframe.
+    """
     log.info("Looking for confirmation button...")
+
+    js_clicker = """() => {
+        // Scroll down so any off-screen confirm button becomes visible/clickable
+        window.scrollTo(0, document.body.scrollHeight);
+        const els = document.querySelectorAll('button, a, [role="button"]');
+        const allText = Array.from(els).map(e => e.textContent.trim()).join(' | ');
+        for (const el of els) {
+            const text = el.textContent.trim().toUpperCase();
+            // Skip generic "RESERVE" labels on the spot map (e.g. "Reserve for: Myself")
+            const isSpotLabel = text.startsWith('RESERVE FOR') || text === 'MYSELF' || text === 'GUEST';
+            if (!isSpotLabel && (
+                text.includes('CONFIRM') || text.includes('COMPLETE') ||
+                text.includes('BOOK') || text === 'RESERVE'
+            )) {
+                el.click();
+                return 'clicked: ' + el.textContent.trim();
+            }
+        }
+        return 'not found. buttons: ' + allText.substring(0, 400);
+    }"""
 
     # Retry loop - button may take a moment to appear after spot selection
     for attempt in range(5):
         time.sleep(3)
 
-        # Try MT iframe first
+        # 1. Try MT iframe first
         mt = get_mt_frame(page)
         if mt:
             try:
-                result = mt.evaluate("""() => {
-                    const els = document.querySelectorAll('button, a, [role="button"]');
-                    const allText = Array.from(els).map(e => e.textContent.trim()).join(' | ');
-                    for (const el of els) {
-                        const text = el.textContent.trim().toUpperCase();
-                        if (text.includes('CONFIRM') || text.includes('COMPLETE') ||
-                            text.includes('BOOK') || text.includes('RESERVE')) {
-                            el.click();
-                            return 'clicked: ' + text;
-                        }
-                    }
-                    return 'not found. buttons: ' + allText.substring(0, 300);
-                }""")
+                result = mt.evaluate(js_clicker)
                 log.info(f"MT iframe confirm (attempt {attempt+1}): {result}")
                 if "clicked" in result:
                     time.sleep(5)
@@ -984,6 +996,21 @@ def confirm_booking(page):
                     return True
             except Exception as e:
                 log.warning(f"MT iframe confirm error: {e}")
+
+        # 2. Also search the main page DOM — confirm button may live outside the iframe
+        try:
+            result = page.evaluate(js_clicker)
+            log.info(f"Main page confirm (attempt {attempt+1}): {result}")
+            if "clicked" in result:
+                time.sleep(5)
+                screenshot(page, "booking_confirmed_main")
+                return True
+        except Exception as e:
+            log.warning(f"Main page confirm error: {e}")
+
+        # 3. Playwright selector fallback (catches buttons the JS loop may miss)
+        if confirm_booking_selectors(page):
+            return True
 
         log.info(f"Confirm button not found on attempt {attempt+1}, waiting...")
 
