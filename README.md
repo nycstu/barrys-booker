@@ -86,6 +86,34 @@ barrys-booker/
 - install_schedule.sh Local cron setup (alternative to Render)
 ```
 
+## Dry-run mode (recommended)
+
+Barry's occasionally ships UI changes that break the selectors in this script. If that happens on a Thursday at noon, you've already missed the booking window. To catch breakage a day early, the repo includes a **dry-run cron** that runs Wednesday at 11:50 ET:
+
+1. Books the same 7:20 AM class for the following Wednesday
+2. Immediately cancels the reservation
+3. Alerts you via email if the cancellation fails
+
+This exercises the exact same code path (login → navigate → RESERVE → spot → CONFIRM) as Thursday's real run, so any regression surfaces 24 hours before it matters.
+
+### Enable in Render
+
+The dry-run service (`barrys-booker-dryrun`) is already defined in `render.yaml`. After pushing the repo, Render will create it alongside the main service. You need to set three additional env vars on the dry-run service:
+
+- `ALERT_EMAIL_FROM` — your Gmail address
+- `ALERT_EMAIL_APP_PASSWORD` — a Gmail App Password (create at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords))
+- `ALERT_EMAIL_TO` — where alerts go (defaults to `stu@setpoint.io`)
+
+If cancellation succeeds, the alert email is never sent. If it fails after 5 retries, you get an email so you can cancel manually.
+
+### Run locally
+
+```bash
+CANCEL_AFTER_BOOKING=true BARRYS_DAY=wednesday HEADLESS=false python book_barrys.py
+```
+
+(Omit `--wait` so it books immediately instead of waiting until noon.)
+
 ## Notes
 
 - `.env` and `auth_state.json` are gitignored - never commit credentials

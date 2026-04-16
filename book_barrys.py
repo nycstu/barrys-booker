@@ -45,6 +45,14 @@ _spots_raw = os.getenv("BARRYS_SPOTS", os.getenv("BARRYS_SPOT", "DF-33"))
 PREFERRED_SPOTS = [s.strip() for s in _spots_raw.split(",")]
 TARGET_DAY = os.getenv("BARRYS_DAY", "thursday")
 
+# Dry-run mode: after a successful booking, cancel the reservation.
+# Used by the Wednesday test cron to verify the booking flow a day before
+# the real Thursday booking window.
+CANCEL_AFTER_BOOKING = os.getenv("CANCEL_AFTER_BOOKING", "false").lower() == "true"
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "stu@setpoint.io")
+ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM")  # e.g. stu@setpoint.io
+ALERT_EMAIL_APP_PASSWORD = os.getenv("ALERT_EMAIL_APP_PASSWORD")  # Gmail app password
+
 BARRYS_BASE = "https://www.barrys.com"
 SCHEDULE_URL = f"{BARRYS_BASE}/schedule/{STUDIO}"
 LOGIN_URL = f"{BARRYS_BASE}/login"
@@ -1047,6 +1055,221 @@ def confirm_booking_selectors(page):
     return False
 
 
+def send_alert_email(subject, body):
+    """Send an alert email via Gmail SMTP.
+
+    Used to notify when a dry-run booking succeeded but the follow-up
+    cancellation failed, leaving a real reservation on the account that
+    needs manual intervention.
+
+    Requires ALERT_EMAIL_FROM and ALERT_EMAIL_APP_PASSWORD env vars.
+    Create a Gmail App Password at https://myaccount.google.com/apppasswords.
+    No-op (with warning) if either is missing.
+    """
+    if not ALERT_EMAIL_FROM or not ALERT_EMAIL_APP_PASSWORD:
+        log.warning("Alert email NOT sent: ALERT_EMAIL_FROM or ALERT_EMAIL_APP_PASSWORD is missing")
+        return False
+
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = ALERT_EMAIL_FROM
+    msg["To"] = ALERT_EMAIL_TO
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=30) as smtp:
+            smtp.login(ALERT_EMAIL_FROM, ALERT_EMAIL_APP_PASSWORD)
+            smtp.send_message(msg)
+        log.info(f"Alert email sent to {ALERT_EMAIL_TO}")
+        return True
+    except Exception as e:
+        log.error(f"Failed to send alert email: {e}")
+        return False
+
+
+def cancel_booking(page, target_date):
+    """Cancel the reservation we just booked for target_date.
+
+    Used in dry-run mode (CANCEL_AFTER_BOOKING=true). Navigates back to the
+    schedule, clicks the booked class (now showing "VIEW RESERVATION"), and
+    walks through the cancel flow. Uses the same dual-search pattern as
+    confirm_booking (MT iframe AND main page) because the cancel UI may live
+    in either.
+
+    Returns True if cancellation succeeded, False otherwise.
+    """
+    log.info(f"Starting cancel flow for {target_date.strftime('%Y-%m-%d')}")
+
+    # Re-navigate to the schedule for the target date. navigate_to_schedule
+    # also handles the weekly advance and date verification for us.
+    if not navigate_to_schedule(page, target_date):
+        log.error("Cancel: could not navigate back to schedule")
+        return False
+
+    screenshot(page, "cancel_schedule_page")
+
+    # Click the booked class (same time slot). It should now render as a
+    # booked row with a "VIEW RESERVATION" action. We just click somewhere
+    # on the row that has the target time — the existing find_and_click_class
+    # logic works because it's searching for the time substring.
+    time_variants = [CLASS_TIME, CLASS_TIME.lstrip("0"), f"{CLASS_TIME} AM", f"{CLASS_TIME.lstrip('0')} AM"]
+    mt = get_mt_frame(page)
+    clicked_row = False
+
+    # Try clicking "VIEW RESERVATION" directly first — it's the most precise.
+    for target in [mt, page] if mt else [page]:
+        if target is None:
+            continue
+        target_name = "MT iframe" if target != page else "main page"
+        try:
+            result = target.evaluate(f"""(timeVariants) => {{
+                const els = document.querySelectorAll('button, a, [role="button"]');
+                for (const el of els) {{
+                    const text = (el.textContent || '').trim().toUpperCase();
+                    if (text === 'VIEW RESERVATION' || text.includes('VIEW RESERVATION')) {{
+                        // Check this button is near our target time by walking up the DOM
+                        let parent = el.parentElement;
+                        for (let i = 0; i < 6 && parent; i++) {{
+                            const ptext = (parent.textContent || '').trim();
+                            for (const t of timeVariants) {{
+                                if (ptext.includes(t)) {{
+                                    el.click();
+                                    return 'clicked VIEW RESERVATION near time: ' + t;
+                                }}
+                            }}
+                            parent = parent.parentElement;
+                        }}
+                    }}
+                }}
+                return 'VIEW RESERVATION not found near any target time';
+            }}""", time_variants)
+            log.info(f"VIEW RESERVATION click ({target_name}): {result}")
+            if "clicked" in result:
+                time.sleep(5)
+                screenshot(page, "cancel_reservation_page")
+                clicked_row = True
+                break
+        except Exception as e:
+            log.warning(f"VIEW RESERVATION search error in {target_name}: {e}")
+
+    if not clicked_row:
+        # Fallback: just click the class row by time (like find_and_click_class does)
+        log.info("VIEW RESERVATION not found; falling back to clicking class row by time")
+        if not find_and_click_class(page):
+            log.error("Cancel: could not click the booked class")
+            screenshot(page, "cancel_class_not_clickable")
+            return False
+
+    # Now find and click the Cancel button on the reservation detail page.
+    # Search both MT iframe and main page. Retry up to 5 times.
+    cancel_js = """() => {
+        window.scrollTo(0, document.body.scrollHeight);
+        const els = document.querySelectorAll('button, a, [role="button"]');
+        const allText = Array.from(els).map(e => e.textContent.trim()).join(' | ');
+        for (const el of els) {
+            const text = (el.textContent || '').trim().toUpperCase();
+            // Match "Cancel", "Cancel Reservation", "Release Spot", etc.
+            // But NOT "Cancel" as a close-button/back-out label like "Cancel Selection"
+            if ((text === 'CANCEL' || text.includes('CANCEL RESERVATION') ||
+                 text.includes('CANCEL BOOKING') || text.includes('RELEASE SPOT') ||
+                 text === 'REMOVE RESERVATION') && text.length < 40) {
+                el.click();
+                return 'clicked: ' + el.textContent.trim();
+            }
+        }
+        return 'not found. buttons: ' + allText.substring(0, 400);
+    }"""
+
+    cancel_clicked = False
+    for attempt in range(5):
+        time.sleep(3)
+        mt = get_mt_frame(page)
+        if mt:
+            try:
+                result = mt.evaluate(cancel_js)
+                log.info(f"MT iframe cancel button (attempt {attempt+1}): {result}")
+                if "clicked" in result:
+                    cancel_clicked = True
+                    break
+            except Exception as e:
+                log.warning(f"MT iframe cancel error: {e}")
+
+        try:
+            result = page.evaluate(cancel_js)
+            log.info(f"Main page cancel button (attempt {attempt+1}): {result}")
+            if "clicked" in result:
+                cancel_clicked = True
+                break
+        except Exception as e:
+            log.warning(f"Main page cancel error: {e}")
+
+        log.info(f"Cancel button not found on attempt {attempt+1}, waiting...")
+
+    if not cancel_clicked:
+        screenshot(page, "cancel_button_not_found")
+        log.error("Could not find Cancel button")
+        return False
+
+    time.sleep(3)
+    screenshot(page, "cancel_confirmation_prompt")
+
+    # Final confirmation — Barry's typically shows "Are you sure?" with a
+    # confirm button. Click through it the same way.
+    confirm_cancel_js = """() => {
+        window.scrollTo(0, document.body.scrollHeight);
+        const els = document.querySelectorAll('button, a, [role="button"]');
+        const allText = Array.from(els).map(e => e.textContent.trim()).join(' | ');
+        for (const el of els) {
+            const text = (el.textContent || '').trim().toUpperCase();
+            // "Yes, cancel", "Confirm Cancellation", "Cancel Reservation" on the confirm dialog
+            if ((text.startsWith('YES') || text.includes('CONFIRM') ||
+                 text.includes('CANCEL RESERVATION') || text.includes('CANCEL BOOKING') ||
+                 text === 'CANCEL') && text.length < 40) {
+                el.click();
+                return 'clicked: ' + el.textContent.trim();
+            }
+        }
+        return 'not found. buttons: ' + allText.substring(0, 400);
+    }"""
+
+    for attempt in range(5):
+        time.sleep(2)
+        mt = get_mt_frame(page)
+        confirmed = False
+        if mt:
+            try:
+                result = mt.evaluate(confirm_cancel_js)
+                log.info(f"MT iframe confirm-cancel (attempt {attempt+1}): {result}")
+                if "clicked" in result:
+                    confirmed = True
+            except Exception as e:
+                log.warning(f"MT iframe confirm-cancel error: {e}")
+
+        if not confirmed:
+            try:
+                result = page.evaluate(confirm_cancel_js)
+                log.info(f"Main page confirm-cancel (attempt {attempt+1}): {result}")
+                if "clicked" in result:
+                    confirmed = True
+            except Exception as e:
+                log.warning(f"Main page confirm-cancel error: {e}")
+
+        if confirmed:
+            time.sleep(5)
+            screenshot(page, "cancel_completed")
+            log.info("Cancellation confirmed")
+            return True
+
+    screenshot(page, "cancel_confirm_not_found")
+    log.error("Could not find final cancel confirmation button")
+    return False
+
+
 def run_booking():
     """Main booking flow."""
     if not EMAIL or not PASSWORD:
@@ -1135,6 +1358,42 @@ def run_booking():
             if not booked:
                 log.error("Could not complete booking after all retries")
                 return False
+
+            # Dry-run mode: cancel the booking we just made so we don't end
+            # up with a real reservation for a day we didn't want to book.
+            if CANCEL_AFTER_BOOKING:
+                log.info("=" * 60)
+                log.info("CANCEL_AFTER_BOOKING=true — starting cancel flow")
+                log.info("=" * 60)
+                time.sleep(5)  # let the booking settle before we cancel it
+
+                cancel_ok = False
+                for cancel_attempt in range(5):
+                    if cancel_attempt > 0:
+                        log.info(f"Cancel retry {cancel_attempt}/5 — waiting 10s...")
+                        time.sleep(10)
+                    try:
+                        if cancel_booking(page, target_date):
+                            cancel_ok = True
+                            break
+                    except Exception as e:
+                        log.error(f"Cancel attempt {cancel_attempt+1} raised: {e}")
+                        screenshot(page, f"cancel_exception_{cancel_attempt+1}")
+
+                if not cancel_ok:
+                    msg = (f"DRY-RUN CANCEL FAILED after 5 attempts.\n\n"
+                           f"Class still booked: {target_date.strftime('%A, %Y-%m-%d')} "
+                           f"at {CLASS_TIME} — studio {STUDIO}.\n\n"
+                           f"Cancel manually in the Barry's app/website ASAP.")
+                    log.error(msg.replace("\n", " "))
+                    send_alert_email(
+                        "[barrys-booker] Dry-run cancel failed — manual action required",
+                        msg,
+                    )
+                    return False
+
+                log.info("DRY-RUN SUCCESS: booked and cancelled cleanly")
+
             return True
 
         except Exception as e:

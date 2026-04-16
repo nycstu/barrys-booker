@@ -1,8 +1,9 @@
 services:
+  # Real booking: Thursday 11:50 ET — waits until 12:00 ET to book next Thursday's class.
   - type: cron
     name: barrys-booker
     runtime: docker
-    schedule: "50 15 * * 4"  # 15:50 UTC = 11:50 ET (logs in early, waits until 12:00 ET to book)
+    schedule: "50 15 * * 4"  # 15:50 UTC = 11:50 ET
     region: oregon
     envVars:
       - key: BARRYS_EMAIL
@@ -17,6 +18,40 @@ services:
         value: "07:20"
       - key: BARRYS_DAY
         value: thursday
+      - key: TZ
+        value: America/New_York
+      - key: HEADLESS
+        value: "true"
+
+  # Dry-run: Wednesday 11:50 ET — books next Wednesday's 7:20 AM class, then
+  # immediately cancels it. Surfaces any Barry's UI changes 24 hours before
+  # the real Thursday booking window.
+  - type: cron
+    name: barrys-booker-dryrun
+    runtime: docker
+    schedule: "50 15 * * 3"  # 15:50 UTC Wednesday = 11:50 ET
+    region: oregon
+    envVars:
+      - key: BARRYS_EMAIL
+        sync: false
+      - key: BARRYS_PASSWORD
+        sync: false
+      - key: BARRYS_SPOTS
+        value: "DF-33,DF-32,DF-30,DF-29,DF-26,DF-27,DF-28"
+      - key: BARRYS_STUDIO
+        value: noho
+      - key: BARRYS_CLASS_TIME
+        value: "07:20"
+      - key: BARRYS_DAY
+        value: wednesday
+      - key: CANCEL_AFTER_BOOKING
+        value: "true"
+      - key: ALERT_EMAIL_TO
+        value: stu@setpoint.io
+      - key: ALERT_EMAIL_FROM
+        sync: false
+      - key: ALERT_EMAIL_APP_PASSWORD
+        sync: false
       - key: TZ
         value: America/New_York
       - key: HEADLESS
