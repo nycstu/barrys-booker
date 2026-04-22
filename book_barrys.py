@@ -863,7 +863,10 @@ def select_spot(page):
         except Exception:
             pass
 
-        # Try each preferred spot in priority order
+        # Try each preferred spot in priority order.
+        # Availability check: only SVG <text>/<tspan> nodes are shown for available spots.
+        # Taken spots are still in the DOM but don't appear as SVG text labels, so searching
+        # all elements (old approach) found and clicked taken spots uselessly.
         for spot in PREFERRED_SPOTS:
             # Generate label variants: "DF-33" -> try "DF-33", "DF33", "F33", "33"
             variants = [spot]
@@ -877,40 +880,43 @@ def select_spot(page):
                 variants.append(num)
 
             try:
-                result = mt.evaluate("""(variants) => {
-                    // Search all elements including SVG text nodes
-                    const els = document.querySelectorAll('*');
+                found_variant = mt.evaluate("""(variants) => {
+                    // Only SVG text/tspan nodes represent available spots on the floor map.
+                    const svgTexts = Array.from(document.querySelectorAll('text, tspan'));
                     for (const variant of variants) {
-                        for (const el of els) {
-                            const text = (el.textContent || '').trim();
-                            if (text === variant && text.length < 15) {
-                                // Check it's not disabled/unavailable
-                                const cls = (typeof el.className === 'string') ? el.className : '';
-                                const disabled = el.disabled || cls.includes('unavailable') || cls.includes('disabled') || el.getAttribute('aria-disabled') === 'true';
-                                if (!disabled) {
-                                    // Use dispatchEvent for SVG elements that don't have .click()
-                                    if (typeof el.click === 'function') {
-                                        el.click();
-                                    } else {
-                                        el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-                                    }
-                                    return 'clicked: ' + variant;
-                                } else {
-                                    return 'unavailable: ' + variant;
-                                }
+                        for (const el of svgTexts) {
+                            if ((el.textContent || '').trim() === variant) {
+                                return variant;
                             }
                         }
                     }
-                    return 'not found';
+                    return null;
                 }""", variants)
-                log.info(f"Spot {spot} -> {result}")
-                if "clicked" in result:
+
+                if found_variant is None:
+                    log.info(f"Spot {spot} not found in SVG floor map (likely taken), trying next...")
+                    continue
+
+                log.info(f"Spot {spot} found in floor map (variant={found_variant}), clicking...")
+                # Native Playwright click fires a trusted event (isTrusted=true).
+                # React's click handler lives on the parent <g> SVG group, not the <text> node.
+                try:
+                    locator = mt.locator(f'svg g:has(text:text-is("{found_variant}"))').last
+                    locator.click(timeout=5000)
+                    log.info(f"Clicked spot {spot} via SVG <g> parent")
                     time.sleep(2)
                     screenshot(page, f"spot_selected_{spot}")
                     return True
-                elif "unavailable" in result:
-                    log.info(f"Spot {spot} is unavailable, trying next...")
-                    continue
+                except Exception as e:
+                    log.warning(f"SVG <g> click failed for {spot}: {e}, trying text locator...")
+                    try:
+                        mt.locator(f'text="{found_variant}"').first.click(timeout=5000)
+                        log.info(f"Clicked spot {spot} via text locator (fallback)")
+                        time.sleep(2)
+                        screenshot(page, f"spot_selected_{spot}")
+                        return True
+                    except Exception as e2:
+                        log.warning(f"Text locator click also failed for {spot}: {e2}")
             except Exception as e:
                 log.warning(f"Spot {spot} error: {e}")
 
