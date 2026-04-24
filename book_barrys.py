@@ -83,18 +83,74 @@ def get_next_target_date():
     return target_date
 
 
+AUTH_STATE_MAX_AGE_DAYS = 7  # Mariana Tek sessions expire; force re-login after this
+
+
+def is_login_modal_visible(page):
+    """Detect the 'Log in to continue' modal that Barry's shows when an
+    unauthenticated user clicks RESERVE on a class. Checks both the main
+    page and the MT iframe — the modal can render in either."""
+    needle_re = r"(?i)log\s*in\s*to\s*continue"
+    try:
+        main_text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        main_text = ""
+    import re as _re
+    if _re.search(needle_re, main_text):
+        return True
+    mt = get_mt_frame(page)
+    if mt:
+        try:
+            mt_text = mt.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            if _re.search(needle_re, mt_text):
+                return True
+        except Exception:
+            pass
+    # Also check for the dialog element directly (modal-root + StyledModal)
+    try:
+        has_modal = page.evaluate("""() => {
+            const root = document.querySelector('#modal-root');
+            if (!root) return false;
+            const dialog = root.querySelector('dialog[open], [role="dialog"]');
+            if (!dialog) return false;
+            const text = (dialog.textContent || '').toLowerCase();
+            return text.includes('log in') || text.includes('login');
+        }""")
+        if has_modal:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def login(page):
     """Log into barrys.com. Uses saved auth state if available."""
     if STATE_FILE.exists():
-        log.info("Found saved auth state, checking if still valid...")
-        # Try loading the schedule page to test if session is active
-        page.goto(SCHEDULE_URL, wait_until="networkidle", timeout=30000)
-        time.sleep(2)
-        # Check if we're redirected to login
-        if "/login" not in page.url and "/sign" not in page.url:
-            log.info("Auth state still valid, skipping login")
-            return True
-        log.info("Auth state expired, logging in fresh...")
+        # Mariana Tek session cookies expire after a couple weeks. Even if the
+        # cookie file exists, treat it as stale past AUTH_STATE_MAX_AGE_DAYS so
+        # we don't end up on the spot-selection page with a "Log in to continue"
+        # modal blocking every click (which is what happened on 2026-04-23).
+        age_days = (time.time() - STATE_FILE.stat().st_mtime) / 86400
+        if age_days > AUTH_STATE_MAX_AGE_DAYS:
+            log.info(f"Auth state is {age_days:.1f} days old (max {AUTH_STATE_MAX_AGE_DAYS}d), forcing fresh login")
+            try:
+                STATE_FILE.unlink()
+            except OSError:
+                pass
+        else:
+            log.info(f"Found saved auth state ({age_days:.1f} days old), checking if still valid...")
+            page.goto(SCHEDULE_URL, wait_until="networkidle", timeout=30000)
+            time.sleep(2)
+            redirected_to_login = "/login" in page.url or "/sign" in page.url
+            modal_visible = is_login_modal_visible(page)
+            if not redirected_to_login and not modal_visible:
+                log.info("Auth state still valid, skipping login")
+                return True
+            log.info(f"Auth state expired (redirect={redirected_to_login}, modal={modal_visible}), logging in fresh...")
+            try:
+                STATE_FILE.unlink()
+            except OSError:
+                pass
 
     log.info(f"Navigating to login page: {LOGIN_URL}")
     try:
@@ -651,38 +707,95 @@ def navigate_to_schedule(page, target_date):
             log.info(f"Next week nav result: {nav_clicked}")
             time.sleep(3)
 
-        # Now click the specific day tab for the target date
+        # Now click the specific day tab for the target date.
+        # Verify after each click that the schedule actually switched to that day —
+        # the previous version (2026-04-23) clicked a deep <span> that didn't
+        # trigger the parent tab's React handler, leaving Monday selected and
+        # booking the wrong class.
         day_short_upper = target_date.strftime("%a").upper()   # "THU"
+        day_short_title = target_date.strftime("%a")           # "Thu"
         month_short = target_date.strftime("%b")               # "Apr"
-        day_num = str(target_date.day)                         # "9"
+        day_num = str(target_date.day)                         # "30"
+        day_header = target_date.strftime("%A, %B %-d")        # "Thursday, April 30"
 
-        clicked_date = mt.evaluate(f"""() => {{
-            const target = '{month_day_target}';
-            const dayShort = '{day_short_upper}';
-            const monthShort = '{month_short}';
-            const dayNum = '{day_num}';
-            const allEls = Array.from(document.querySelectorAll('*'));
+        for click_attempt in range(3):
+            clicked_date = mt.evaluate(f"""() => {{
+                const target = '{month_day_target}';
+                const dayShort = '{day_short_upper}';
+                const dayShortTitle = '{day_short_title}';
+                const monthShort = '{month_short}';
+                const dayNum = '{day_num}';
 
-            // Log all short texts for debugging
-            const shortTexts = allEls.map(e => e.textContent.trim())
-                .filter(t => t.length > 0 && t.length < 30)
-                .filter((v,i,a) => a.indexOf(v) === i).slice(0, 40);
-            console.log('Visible texts:', JSON.stringify(shortTexts));
+                const matchers = [
+                    target + dayShortTitle,                    // "Apr 30Thu" (concatenated tab label)
+                    target + ' ' + dayShortTitle,              // "Apr 30 Thu"
+                    target,                                    // "Apr 30"
+                    monthShort + ' ' + dayNum,
+                    dayNum + ' ' + dayShort,
+                ];
 
-            const matchers = [target, monthShort + ' ' + dayNum, dayNum + ' ' + dayShort];
-            for (const matcher of matchers) {{
-                for (const el of allEls) {{
-                    const text = el.textContent.trim();
-                    if (text.includes(matcher) && text.length < 30) {{
-                        el.click();
-                        return 'clicked (' + matcher + '): ' + text;
+                // Prefer clickable tab-like elements (button, a, role=button, role=tab).
+                const clickableTags = ['BUTTON', 'A'];
+                const clickableRoles = ['button', 'tab', 'link'];
+                const isClickable = (el) => {{
+                    if (clickableTags.includes(el.tagName)) return true;
+                    const role = el.getAttribute('role');
+                    if (role && clickableRoles.includes(role)) return true;
+                    return false;
+                }};
+
+                const allEls = Array.from(document.querySelectorAll('*'));
+
+                // Pass 1: clickable elements whose text matches a matcher
+                for (const matcher of matchers) {{
+                    for (const el of allEls) {{
+                        const text = el.textContent.trim();
+                        if (isClickable(el) && text.includes(matcher) && text.length < 30) {{
+                            el.click();
+                            return 'clicked tab (' + matcher + '): ' + text;
+                        }}
                     }}
                 }}
-            }}
-            return 'tab not found. visible: ' + JSON.stringify(shortTexts.slice(0,20));
-        }}""")
-        log.info(f"Date tab click: {clicked_date}")
-        time.sleep(3)
+
+                // Pass 2: any element matching, walk up to clickable ancestor
+                for (const matcher of matchers) {{
+                    for (const el of allEls) {{
+                        const text = el.textContent.trim();
+                        if (text.includes(matcher) && text.length < 30) {{
+                            let cur = el;
+                            for (let i = 0; i < 6 && cur; i++) {{
+                                if (isClickable(cur)) {{
+                                    cur.click();
+                                    return 'clicked ancestor (' + matcher + '): ' + cur.tagName + '/' + text;
+                                }}
+                                cur = cur.parentElement;
+                            }}
+                            // Fallback: click the leaf element itself
+                            el.click();
+                            return 'clicked leaf (' + matcher + '): ' + text;
+                        }}
+                    }}
+                }}
+
+                const shortTexts = allEls.map(e => e.textContent.trim())
+                    .filter(t => t.length > 0 && t.length < 30)
+                    .filter((v,i,a) => a.indexOf(v) === i).slice(0, 20);
+                return 'tab not found. visible: ' + JSON.stringify(shortTexts);
+            }}""")
+            log.info(f"Date tab click attempt {click_attempt+1}: {clicked_date}")
+            time.sleep(3)
+
+            # Verify the schedule now shows our target day
+            try:
+                check_body = mt.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                check_body = ""
+            if day_header in check_body or target_date.strftime("%A, %B %d") in check_body:
+                log.info(f"Day tab click verified: schedule now shows '{day_header}'")
+                break
+            log.warning(f"Day tab click did not switch schedule to '{day_header}', retrying...")
+        else:
+            log.error(f"Failed to switch schedule to '{day_header}' after 3 click attempts")
     else:
         # No MT iframe on schedule page, try clicking date tabs on main page
         log.info("No MT iframe found, trying main page date navigation...")
@@ -704,20 +817,20 @@ def navigate_to_schedule(page, target_date):
             body_text = mt.evaluate("() => document.body ? document.body.innerText.substring(0, 1000) : ''")
             log.info(f"MT schedule content: {body_text[:600]}")
 
-            # Safety check: confirm the SPECIFIC target date appears in the schedule
-            # Must match the actual date (e.g. "Apr 9" or "April 9") - NOT just "THU"
-            # because today could also be Thursday
-            month_day = target_date.strftime("%b %-d")   # "Apr 9"
-            month_day2 = target_date.strftime("%b %d")   # "Apr 09"
-            day_num = str(target_date.day)               # "9"
-            date_checks = [month_day, month_day2, date_str]  # "Apr 9", "Apr 09", "2026-04-09"
-            date_found = any(d in body_text for d in date_checks)
-            log.info(f"Date check - looking for {date_checks} in schedule body")
-            if date_found:
-                log.info(f"DATE VERIFIED: schedule is showing {date_str}")
+            # Safety check: confirm the SELECTED day matches our target.
+            # The schedule renders ALL 7 day tabs in the current week, so checking
+            # for "Apr 30" anywhere in the body matches even when Apr 27 is the
+            # currently-selected day. Instead we look for the day-name header
+            # (e.g. "Thursday, April 30, 2026") that only appears for the
+            # selected day. 2026-04-23 booked the wrong day because of this.
+            day_header = target_date.strftime("%A, %B %-d")           # "Thursday, April 30"
+            day_header_padded = target_date.strftime("%A, %B %d")     # "Thursday, April 30" (or "April 09")
+            log.info(f"Date check - looking for day header '{day_header}' in schedule body")
+            if day_header in body_text or day_header_padded in body_text:
+                log.info(f"DATE VERIFIED: schedule header shows '{day_header}'")
             else:
-                log.error(f"DATE NOT VERIFIED - schedule is NOT showing {date_str}. "
-                          f"ABORTING to avoid booking wrong day. Body: {body_text[:300]}")
+                log.error(f"DATE NOT VERIFIED - schedule is NOT showing '{day_header}'. "
+                          f"ABORTING to avoid booking wrong day. Body: {body_text[:500]}")
                 return False
         except Exception as e:
             log.warning(f"Could not verify schedule date: {e}")
@@ -824,10 +937,29 @@ def find_and_click_class(page):
 
 
 def select_spot(page):
-    """Select preferred spot from the floor map, trying each in priority order."""
+    """Select preferred spot from the floor map, trying each in priority order.
+
+    Returns True on success. Returns the string 'AUTH_FAILED' if the
+    'Log in to continue' modal is blocking the spot map (so the caller can
+    delete cached auth and re-login), otherwise False.
+    """
     log.info(f"Looking for spots (priority order): {PREFERRED_SPOTS}")
     time.sleep(3)
     screenshot(page, "spot_selection_page")
+
+    # Auth modal check FIRST — if the "Log in to continue" dialog is up,
+    # every spot click will time out with "subtree intercepts pointer events".
+    # Bail out fast so the caller can re-login rather than burning 5s per spot.
+    if is_login_modal_visible(page):
+        log.error("'Log in to continue' modal is blocking the spot map - auth has expired mid-flow")
+        screenshot(page, "auth_modal_on_spot_page")
+        try:
+            if STATE_FILE.exists():
+                STATE_FILE.unlink()
+                log.info("Deleted stale auth_state.json")
+        except OSError as e:
+            log.warning(f"Could not delete auth_state.json: {e}")
+        return "AUTH_FAILED"
 
     # Re-acquire MT iframe (may have changed after RESERVE click)
     mt = get_mt_frame(page)
@@ -898,25 +1030,31 @@ def select_spot(page):
                     continue
 
                 log.info(f"Spot {spot} found in floor map (variant={found_variant}), clicking...")
-                # Native Playwright click fires a trusted event (isTrusted=true).
-                # React's click handler lives on the parent <g> SVG group, not the <text> node.
+                # Two click strategies, ordered by observed reliability against
+                # the live Mariana Tek floor map (verified 2026-04-24):
+                #   1. Playwright text locator — fires a real trusted event that
+                #      React picks up. This is what actually completed the booking.
+                #   2. SVG <g> locator — works some of the time; fails when the
+                #      parent <svg class="StyledMap"> intercepts pointer events.
+                # We don't bother with JS dispatchEvent — React's synthetic event
+                # system ignores manually-dispatched MouseEvents on SVG nodes.
                 try:
-                    locator = mt.locator(f'svg g:has(text:text-is("{found_variant}"))').last
-                    locator.click(timeout=5000)
-                    log.info(f"Clicked spot {spot} via SVG <g> parent")
+                    mt.locator(f'text="{found_variant}"').first.click(timeout=3000)
+                    log.info(f"Clicked spot {spot} via text locator")
                     time.sleep(2)
                     screenshot(page, f"spot_selected_{spot}")
                     return True
                 except Exception as e:
-                    log.warning(f"SVG <g> click failed for {spot}: {e}, trying text locator...")
-                    try:
-                        mt.locator(f'text="{found_variant}"').first.click(timeout=5000)
-                        log.info(f"Clicked spot {spot} via text locator (fallback)")
-                        time.sleep(2)
-                        screenshot(page, f"spot_selected_{spot}")
-                        return True
-                    except Exception as e2:
-                        log.warning(f"Text locator click also failed for {spot}: {e2}")
+                    log.warning(f"Text locator click failed for {spot}: {e}, trying SVG <g> locator...")
+
+                try:
+                    mt.locator(f'svg g:has(text:text-is("{found_variant}"))').last.click(timeout=3000)
+                    log.info(f"Clicked spot {spot} via SVG <g> locator")
+                    time.sleep(2)
+                    screenshot(page, f"spot_selected_{spot}")
+                    return True
+                except Exception as e:
+                    log.warning(f"SVG <g> locator click also failed for {spot}: {e}")
             except Exception as e:
                 log.warning(f"Spot {spot} error: {e}")
 
@@ -1344,6 +1482,15 @@ def run_booking():
                 # Step 6: Select spot from the map
                 time.sleep(3)
                 spot_ok = select_spot(page)
+                if spot_ok == "AUTH_FAILED":
+                    log.warning("Auth modal blocked spot selection - re-logging in and retrying from scratch")
+                    if not login(page):
+                        log.error("Re-login failed after auth modal detection")
+                        return False
+                    if not navigate_to_schedule(page, target_date):
+                        log.error("Schedule re-navigation failed after re-login")
+                        return False
+                    continue  # restart the find/reserve/spot/confirm loop
                 if not spot_ok:
                     log.error("None of the preferred spots are available - ABORTING booking. "
                               f"Preferred: {PREFERRED_SPOTS}")
@@ -1364,6 +1511,15 @@ def run_booking():
             if not booked:
                 log.error("Could not complete booking after all retries")
                 return False
+
+            # Refresh saved auth state. Cookies rotate during a session, so
+            # rewriting after a successful booking keeps the cache warm and
+            # extends the time before we hit the AUTH_STATE_MAX_AGE_DAYS limit.
+            try:
+                context.storage_state(path=str(STATE_FILE))
+                log.info(f"Refreshed auth_state at {STATE_FILE}")
+            except Exception as e:
+                log.warning(f"Could not refresh auth_state after booking: {e}")
 
             # Dry-run mode: cancel the booking we just made so we don't end
             # up with a real reservation for a day we didn't want to book.
@@ -1439,10 +1595,70 @@ def wait_for_booking_window(max_wait_minutes=15):
     log.info("12:00:00 ET - Booking window open - GO!")
 
 
+def notify_run_outcome(success, target_date, error_summary, is_dryrun):
+    """Send a summary email after every run so we always know what happened.
+
+    The existing cancel-failure alert still fires separately for its specific
+    case; this is the umbrella notification covering success too. No-op if
+    ALERT_EMAIL_FROM / ALERT_EMAIL_APP_PASSWORD aren't configured.
+    """
+    if not (ALERT_EMAIL_FROM and ALERT_EMAIL_APP_PASSWORD):
+        log.info("Skipping outcome email (ALERT_EMAIL_FROM/APP_PASSWORD not set)")
+        return
+
+    mode = "DRY-RUN" if is_dryrun else "BOOKING"
+    target_short = target_date.strftime("%a %b %-d")
+    target_long = target_date.strftime("%A, %Y-%m-%d")
+
+    if success:
+        subject = f"[barrys-booker] OK {mode}: {target_short} {CLASS_TIME}"
+        body = (
+            f"Run succeeded.\n\n"
+            f"Mode: {mode}\n"
+            f"Target: {target_long} at {CLASS_TIME}\n"
+            f"Studio: {STUDIO}\n"
+            f"Preferred spots: {', '.join(PREFERRED_SPOTS)}\n"
+        )
+    else:
+        urgency = ("DRY-RUN failure — fix before Thursday's real booking window."
+                   if is_dryrun else
+                   "REAL BOOKING failed — booking window has now closed for this class.")
+        subject = f"[barrys-booker] FAILED {mode}: {target_short} {CLASS_TIME}"
+        body = (
+            f"Run FAILED.\n\n"
+            f"{urgency}\n\n"
+            f"Mode: {mode}\n"
+            f"Target: {target_long} at {CLASS_TIME}\n"
+            f"Studio: {STUDIO}\n"
+            f"Preferred spots: {', '.join(PREFERRED_SPOTS)}\n\n"
+            f"Reason: {error_summary or 'unknown — check log'}\n\n"
+            f"Log: {LOG_DIR}\n"
+            f"Screenshots: {SCREENSHOT_DIR}\n"
+        )
+
+    send_alert_email(subject, body)
+
+
 if __name__ == "__main__":
     log.info("=" * 60)
     log.info("Barry's Bootcamp Auto-Booker Starting")
+    log.info(f"Mode: {'DRY-RUN' if CANCEL_AFTER_BOOKING else 'REAL BOOKING'}")
     log.info("=" * 60)
 
-    success = run_booking()
+    target_date = get_next_target_date()
+    success = False
+    error_summary = None
+    try:
+        success = run_booking()
+        if not success:
+            error_summary = "run_booking() returned False — see log for details"
+    except Exception as e:
+        error_summary = f"Crashed: {type(e).__name__}: {e}"
+        log.exception("Booking crashed with unhandled exception")
+
+    try:
+        notify_run_outcome(success, target_date, error_summary, CANCEL_AFTER_BOOKING)
+    except Exception as e:
+        log.error(f"Outcome notification failed: {e}")
+
     sys.exit(0 if success else 1)
