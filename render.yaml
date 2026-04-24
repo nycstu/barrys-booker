@@ -22,6 +22,16 @@ services:
         value: America/New_York
       - key: HEADLESS
         value: "true"
+      # Outcome notification email — same address as the dry-run service.
+      # ALERT_EMAIL_FROM and ALERT_EMAIL_APP_PASSWORD must be set in the
+      # Render dashboard (Settings > Environment) — they're sync:false so
+      # they don't end up in version control.
+      - key: ALERT_EMAIL_TO
+        value: stu@setpoint.io
+      - key: ALERT_EMAIL_FROM
+        sync: false
+      - key: ALERT_EMAIL_APP_PASSWORD
+        sync: false
 
   # Dry-run: Wednesday 11:50 ET — books next Wednesday's 7:20 AM class, then
   # immediately cancels it. Surfaces any Barry's UI changes 24 hours before
